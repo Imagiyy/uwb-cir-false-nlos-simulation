@@ -116,5 +116,5 @@ chmod +x run_all.sh
 * **Datasets:** Fontaine et al. Industrial IIoT UWB datasets (`IIoT19`/`IIoT20`) and Santamaria `DW1000`/`DW3000` complex-IQ captures.
 * **Baseline Reference:** [LENS-TUGraz/InSight](https://github.com/LENS-TUGraz/InSight) (Gallacher et al., EWSN 2023), reimplemented self-contained in PyTorch inside [`src/eval_insight.py`](src/eval_insight.py).
 * **Citation:** Metadata provided in [`CITATION.cff`](CITATION.cff) (use GitHub's **"Cite this repository"** panel).
-* **Maintenance & Contact:** Archived read-only by [@Imagiyy](https://github.com/Imagiyy) — no further updates, pull requests, or hardware follow-ups are planned.
+* **Maintenance & Contact:** Archived read-only by [@Imagiyy](https://github.com/Imagiyy) ([zuwiabrar@gmail.com](mailto:zuwiabrar@gmail.com)) — no further updates, pull requests, or hardware follow-ups are planned.
 * **License:** Released under the [MIT License](LICENSE).
