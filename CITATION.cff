@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+title: "Phantom NLOS: Sub-Direct-Path UWB CIR False-NLOS Simulation Benchmark"
+message: "If you reference this archived simulation benchmark, please cite it using the metadata below."
+type: software
+authors:
+  - name: "Imagiyy"
+repository-code: "https://github.com/Imagiyy/uwb-cir-false-nlos-simulation"
+license: MIT
+date-released: "2026-11-27"
+abstract: >-
+  Completed, simulation-only benchmark evaluating sub-direct-path UWB Channel
+  Impulse Response (CIR) multipath pulse injection and false-NLOS anchor
+  exclusion robustness across classical rules, gradient-boosted trees, 1D-CNNs,
+  and InSight (REMNet, SVM, XGBoost) baselines on Fontaine IIoT19/IIoT20 (DW1000)
+  and Santamaria (DW3000) datasets.
+keywords:
+  - uwb
+  - ultra-wideband
+  - dw3000
+  - dw1000
+  - channel-impulse-response
+  - nlos-detection
+  - physical-layer-security
+  - remnet
+  - simulation

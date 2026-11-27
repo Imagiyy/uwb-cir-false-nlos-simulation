@@ -14,6 +14,15 @@ Offline simulation and robustness evaluation measuring how delayed, sub-direct-p
 
 ---
 
+## About
+
+This project investigates whether injecting a **delayed, low-power copy** (`Δt >= 10 ns`) of a legitimate Line-of-Sight (LOS) UWB pulse — leaving the first-path leading edge (`taps[0:24]`) untouched (`ΔToF = 0`) — can either bias ML ranging-error regressors (`> 0.5 m`) or flip LOS/NLOS classifiers into triggering **false-NLOS anchor exclusion**. It is built for UWB physical-layer security researchers and embedded localization engineers comparing waveform architectures (`REMNet`, `1D-CNN`, `LightGBM`, `XGBoost`, `SVM`, `APS006`).
+
+* **Scope:** Purely offline waveform/CIR simulation across real `DW1000` (`Fontaine IIoT19/IIoT20`) and `DW3000` (`Santamaria`) captures, paired with a closed-form STS detectability bound (`alpha_max`).
+* **Final status:** Stopped at simulation; archived read-only as a complete, reproducible reference.
+
+---
+
 ## Quickstart
 
 Place the upstream datasets under `data/fontaine/` and `data/santamaria_dw3000/data/`, then run the full reproducible pipeline (`Python 3.12+`):
@@ -73,6 +82,8 @@ chmod +x run_all.sh
 
 ```text
 .
+├── .gitattributes
+├── CITATION.cff
 ├── LICENSE
 ├── README.md
 ├── requirements.txt
@@ -100,8 +111,10 @@ chmod +x run_all.sh
 
 ---
 
-## Attribution & License
+## Attribution, Citation & License
 
 * **Datasets:** Fontaine et al. Industrial IIoT UWB datasets (`IIoT19`/`IIoT20`) and Santamaria `DW1000`/`DW3000` complex-IQ captures.
 * **Baseline Reference:** [LENS-TUGraz/InSight](https://github.com/LENS-TUGraz/InSight) (Gallacher et al., EWSN 2023), reimplemented self-contained in PyTorch inside [`src/eval_insight.py`](src/eval_insight.py).
+* **Citation:** Metadata provided in [`CITATION.cff`](CITATION.cff) (use GitHub's **"Cite this repository"** panel).
+* **Maintenance & Contact:** Archived read-only by [@Imagiyy](https://github.com/Imagiyy) — no further updates, pull requests, or hardware follow-ups are planned.
 * **License:** Released under the [MIT License](LICENSE).
