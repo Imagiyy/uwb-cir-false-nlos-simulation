@@ -1,0 +1,9 @@
+MOVE 1 AUDIT SUMMARY: SUB--6 dB REMNet & DIFFUSE LIGHTGBM CHECK
+Check 1 (Zero-injection identity): PASS (0.0% flips, 0.0 diff across IIoT19/IIoT20/DW3000)
+Check 3 (fp_idx=20 lock & 119-tap unpadded ablation): PASS (fp_idx 100% locked; REMNet-119 clean Acc=0.984)
+Fontaine IIoT19        | REMNet-119 (unpadded)  | single  | grid_p70= -7.5 dB (α=0.422) [lin_interp=-8.27 dB, α=0.386] | <α_max(10/15/20dB,κ=2): True/False/False
+Fontaine IIoT19        | REMNet-119 (unpadded)  | diffuse | grid_p70=-10.5 dB (α=0.299) [lin_interp=-10.91 dB, α=0.285] | <α_max(10/15/20dB,κ=2): True/True/False
+Fontaine IIoT19        | LightGBM-Cls (CIR)     | single  | grid_p70= -3.0 dB (α=0.708) [lin_interp=-5.05 dB, α=0.559] | <α_max(10/15/20dB,κ=2): False/False/False
+Fontaine IIoT19        | LightGBM-Cls (CIR)     | diffuse | grid_p70= -7.5 dB (α=0.422) [lin_interp=-7.79 dB, α=0.408] | <α_max(10/15/20dB,κ=2): True/False/False
+Santamaria DW3000 (5φ) | LightGBM-Cls (CIR)     | single  | grid_p70= -1.5 dB (α=0.841) [lin_interp=-1.56 dB, α=0.835] | <α_max(10/15/20dB,κ=2): False/False/False
+Santamaria DW3000 (5φ) | LightGBM-Cls (CIR)     | diffuse | grid_p70= -1.5 dB (α=0.841) [lin_interp=-1.84 dB, α=0.809] | <α_max(10/15/20dB,κ=2): False/False/False

@@ -1,0 +1,44 @@
+PART A: ZERO-SHOT CONDITIONED FLIP AUDIT (flips / clean_predicted_LOS)
+fontaine_iiot19      | rem172 (861/907) | single  | @-6dB=100.0% | p70= -9.0 dB (α=0.355) [lin=-10.35 dB, α=0.304] | <α_max(10/15/20dB,κ=2): True/True/False
+fontaine_iiot19      | rem172 (861/907) | diffuse | @-6dB=100.0% | p70=-12.0 dB (α=0.251) [lin=-13.54 dB, α=0.210] | <α_max(10/15/20dB,κ=2): True/True/False
+fontaine_iiot19      | rem119 (862/907) | single  | @-6dB=100.0% | p70= -7.5 dB (α=0.422) [lin=-8.54 dB, α=0.374] | <α_max(10/15/20dB,κ=2): True/False/False
+fontaine_iiot19      | rem119 (862/907) | diffuse | @-6dB=100.0% | p70=-10.5 dB (α=0.299) [lin=-11.27 dB, α=0.273] | <α_max(10/15/20dB,κ=2): True/True/False
+fontaine_iiot19      | lgbm   (860/907) | single  | @-6dB= 68.7% | p70= -3.0 dB (α=0.708) [lin=-5.76 dB, α=0.515] | <α_max(10/15/20dB,κ=2): False/False/False
+fontaine_iiot19      | lgbm   (860/907) | diffuse | @-6dB= 90.2% | p70= -7.5 dB (α=0.422) [lin=-8.11 dB, α=0.393] | <α_max(10/15/20dB,κ=2): True/False/False
+fontaine_iiot20_5phi | rem172 (300/300) | single  | @-6dB=100.0% | p70= -7.5 dB (α=0.422) [lin=-8.27 dB, α=0.386] | <α_max(10/15/20dB,κ=2): True/False/False
+fontaine_iiot20_5phi | rem172 (300/300) | diffuse | @-6dB= 99.9% | p70= -7.5 dB (α=0.422) [lin=-8.48 dB, α=0.377] | <α_max(10/15/20dB,κ=2): True/False/False
+fontaine_iiot20_5phi | rem119 (300/300) | single  | @-6dB= 92.6% | p70= -6.0 dB (α=0.501) [lin=-6.87 dB, α=0.453] | <α_max(10/15/20dB,κ=2): True/False/False
+fontaine_iiot20_5phi | rem119 (300/300) | diffuse | @-6dB= 95.0% | p70= -7.5 dB (α=0.422) [lin=-7.73 dB, α=0.411] | <α_max(10/15/20dB,κ=2): True/False/False
+fontaine_iiot20_5phi | lgbm   (300/300) | single  | @-6dB= 79.0% | p70= -6.0 dB (α=0.501) [lin=-6.23 dB, α=0.488] | <α_max(10/15/20dB,κ=2): True/False/False
+fontaine_iiot20_5phi | lgbm   (300/300) | diffuse | @-6dB= 73.5% | p70= -6.0 dB (α=0.501) [lin=-6.10 dB, α=0.495] | <α_max(10/15/20dB,κ=2): True/False/False
+dw3000_complex_5phi  | rem172 (169/250) | single  | @-6dB= 97.4% | p70= -9.0 dB (α=0.355) [lin=-9.03 dB, α=0.353] | <α_max(10/15/20dB,κ=2): True/True/False
+dw3000_complex_5phi  | rem172 (169/250) | diffuse | @-6dB= 95.3% | p70= -9.0 dB (α=0.355) [lin=-9.09 dB, α=0.351] | <α_max(10/15/20dB,κ=2): True/True/False
+dw3000_complex_5phi  | rem119 (174/250) | single  | @-6dB= 94.5% | p70= -7.5 dB (α=0.422) [lin=-8.23 dB, α=0.388] | <α_max(10/15/20dB,κ=2): True/False/False
+dw3000_complex_5phi  | rem119 (174/250) | diffuse | @-6dB= 93.0% | p70= -7.5 dB (α=0.422) [lin=-8.32 dB, α=0.384] | <α_max(10/15/20dB,κ=2): True/False/False
+dw3000_complex_5phi  | lgbm   (202/250) | single  | @-6dB= 59.6% | p70= -3.0 dB (α=0.708) [lin=-4.45 dB, α=0.599] | <α_max(10/15/20dB,κ=2): False/False/False
+dw3000_complex_5phi  | lgbm   (202/250) | diffuse | @-6dB= 57.4% | p70= -3.0 dB (α=0.708) [lin=-4.35 dB, α=0.606] | <α_max(10/15/20dB,κ=2): False/False/False
+
+PART B: DISJOINT DW3000 CLEAN METRICS (Train=2514 [42 pids], Val=742 [11 pids], Test=2289 [39 pids])
+ZeroShot-Fontaine-REMNet-119 | Acc=0.750 | F1=0.688 | AUROC=0.888 | LOS_rec=0.695 | NLOS_rec=0.867 | OOD_Cal_LOS_rec=0.864
+FineTuned-REMNet-119         | Acc=0.929 | F1=0.882 | AUROC=0.987 | LOS_rec=0.970 | NLOS_rec=0.841 | OOD_Cal_LOS_rec=1.000
+Native-DW3000-REMNet-119     | Acc=0.979 | F1=0.968 | AUROC=0.999 | LOS_rec=0.977 | NLOS_rec=0.985 | OOD_Cal_LOS_rec=1.000
+Native-DW3000-REMNet-119-Bal | Acc=0.979 | F1=0.967 | AUROC=0.999 | LOS_rec=0.969 | NLOS_rec=1.000 | OOD_Cal_LOS_rec=1.000
+Native-DW3000-XGB-Emb        | Acc=0.891 | F1=0.816 | AUROC=0.961 | LOS_rec=0.953 | NLOS_rec=0.760 | OOD_Cal_LOS_rec=1.000
+Native-DW3000-XGB-Full       | Acc=0.896 | F1=0.814 | AUROC=0.985 | LOS_rec=0.983 | NLOS_rec=0.710 | OOD_Cal_LOS_rec=1.000
+Native-DW3000-LightGBM       | Acc=0.999 | F1=0.998 | AUROC=1.000 | LOS_rec=1.000 | NLOS_rec=0.996 | OOD_Cal_LOS_rec=1.000
+
+PART B2: CONDITIONED >=70%-FLIP THRESHOLDS ON HELD-OUT DW3000 TEST LOS (n=300, 5φ)
+ZeroShot-Fontaine-REMNet-119 (227/300) | single  | @-10.5= 43.9% @-6= 90.9% @0=100.0% | p70= -7.5 dB (α=0.422) [lin=-8.25 dB, α=0.387] | <α_max(10/15/20dB,κ=2): True/False/False
+ZeroShot-Fontaine-REMNet-119 (227/300) | diffuse | @-10.5= 40.0% @-6= 91.7% @0=100.0% | p70= -7.5 dB (α=0.422) [lin=-8.06 dB, α=0.396] | <α_max(10/15/20dB,κ=2): True/False/False
+FineTuned-REMNet-119         (295/300) | single  | @-10.5=  0.5% @-6=  3.5% @0= 62.3% | p70= +3.0 dB (α=1.413) [lin=+0.62 dB, α=1.074] | <α_max(10/15/20dB,κ=2): False/False/False
+FineTuned-REMNet-119         (295/300) | diffuse | @-10.5=  0.5% @-6=  3.6% @0= 56.1% | p70= +3.0 dB (α=1.413) [lin=+0.99 dB, α=1.120] | <α_max(10/15/20dB,κ=2): False/False/False
+Native-DW3000-REMNet-119     (297/300) | single  | @-10.5=  0.5% @-6=  1.1% @0= 10.0% | p70= +6.0 dB (α=1.995) [lin=+4.99 dB, α=1.775] | <α_max(10/15/20dB,κ=2): False/False/False
+Native-DW3000-REMNet-119     (297/300) | diffuse | @-10.5=  0.3% @-6=  1.1% @0=  7.8% | p70= +6.0 dB (α=1.995) [lin=+5.16 dB, α=1.811] | <α_max(10/15/20dB,κ=2): False/False/False
+Native-DW3000-REMNet-119-Bal (295/300) | single  | @-10.5=  0.5% @-6=  1.0% @0= 11.7% | p70= +6.0 dB (α=1.995) [lin=+5.18 dB, α=1.816] | <α_max(10/15/20dB,κ=2): False/False/False
+Native-DW3000-REMNet-119-Bal (295/300) | diffuse | @-10.5=  0.3% @-6=  1.1% @0=  8.3% | p70= +6.0 dB (α=1.995) [lin=+5.10 dB, α=1.800] | <α_max(10/15/20dB,κ=2): False/False/False
+Native-DW3000-XGB-Emb        (293/300) | single  | @-10.5=  2.5% @-6=  4.2% @0=  5.5% | never >=70% (peak   7.4% at  +6.0 dB)
+Native-DW3000-XGB-Emb        (293/300) | diffuse | @-10.5=  2.0% @-6=  3.6% @0=  5.9% | never >=70% (peak   7.6% at  +6.0 dB)
+Native-DW3000-XGB-Full       (297/300) | single  | @-10.5=  1.5% @-6=  2.6% @0=  4.2% | never >=70% (peak   5.6% at  +6.0 dB)
+Native-DW3000-XGB-Full       (297/300) | diffuse | @-10.5=  1.0% @-6=  2.2% @0=  5.5% | never >=70% (peak   6.9% at  +6.0 dB)
+Native-DW3000-LightGBM       (300/300) | single  | @-10.5=  0.0% @-6=  0.3% @0=  1.3% | never >=70% (peak  35.8% at  +6.0 dB)
+Native-DW3000-LightGBM       (300/300) | diffuse | @-10.5=  0.0% @-6=  0.1% @0=  1.4% | never >=70% (peak  36.1% at  +6.0 dB)

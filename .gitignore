@@ -30,8 +30,8 @@ models/
 *.pth
 *.log
 
-# Generated outputs
-results/
+# Generated outputs (tracked in final archive for self-contained plots/reports)
+# results/
 
 # OS / editor files
 .DS_Store

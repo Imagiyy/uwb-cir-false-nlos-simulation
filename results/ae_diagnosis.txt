@@ -1,0 +1,5 @@
+1. Clean fit: AE-Reg A has substantially weaker clean generalization (val/test RMSE 334mm) than CNN-Reg A (295mm), predicting near-zero bias on LOS (-0.034m) vs NLOS (+0.170m).
+2. OOD reconstruction spike: At dt=20ns, +6dB, AE reconstruction MSE jumps 11.2x clean LOS (0.00816 -> 0.09122), pushing latent code off the training manifold.
+3. Spatial bottleneck coupling: AE encoder uses 8 coarse spatial bins (~20ns/bin); dt=20ns lands squarely in early-multipath bin 1 (dz=3.78, bin sensitivity=+0.097m/unit), driving corr(Δz_bin1, Δb)=+0.968.
+4. Contrast with CNN-Reg A: CNN GlobalAvgPool discards delay-bin localization so +6dB energy raises overall SNR estimate (Δb=-0.011m), whereas AE-Reg's positive bin-1 weight extrapolates to +0.464m (45.6% ASR>0.5m) ONLY at dt=10-20ns before turning negative at dt>=35ns.
+5. Conclusion: The +0.464m spike is a narrow OOD latent-manifold extrapolation artifact localized to early-bin (10-20ns) weak-fit AE representations, NOT a general >0.5m bias exploit across strong ranging regressors.
