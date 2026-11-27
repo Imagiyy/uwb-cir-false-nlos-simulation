@@ -32,7 +32,8 @@ def compute_features_from_cir(
     cir_mag : 1-D float array
         Magnitude envelope of the CIR (already |h| or sqrt(I²+Q²)).
     fp_idx : int
-        First-path tap index (in tap units, NOT raw register fp_ind).
+        First-path tap index inside ``cir_mag`` (e.g., 51 for CIRsV2 150-tap
+        slices, or round(fp_ind/64) for full 1016-tap captures).
     signal_window : int
         Taps after fp_idx to include in the "signal" region.
 
@@ -48,6 +49,7 @@ def compute_features_from_cir(
     noise = cir_mag[ns:ne]
     mu_n = float(np.mean(noise)) if len(noise) > 0 else 0.0
     std_n = float(np.std(noise))  if len(noise) > 0 else 1e-12
+    noise_pow_mean = float(np.mean(noise ** 2)) if len(noise) > 0 else 1e-12
 
     # ---- signal window [fp-3 … fp+window) ----
     ss = max(0, fp - 3)
@@ -58,6 +60,7 @@ def compute_features_from_cir(
     fp3 = cir_mag[fp : min(N, fp + 3)]
     fpp_lin = float(np.sum(fp3 ** 2)) if len(fp3) > 0 else 1e-12
     FPP_dB = 10.0 * np.log10(max(fpp_lin, 1e-12))
+    FP_SNR_dB = 10.0 * np.log10(max(fpp_lin, 1e-12) / max(3.0 * noise_pow_mean, 1e-12))
 
     # ---- Total Received Power over signal window ----
     rxp_lin = float(np.sum(signal ** 2)) if len(signal) > 0 else 1e-12
@@ -85,14 +88,18 @@ def compute_features_from_cir(
     if np.sum(above) >= 3:
         t_ns     = np.arange(len(signal), dtype=float) * TAP_NS
         amp_cl   = signal[above]
+        pow_cl   = amp_cl ** 2
         t_cl     = t_ns[above]
         t_fp_ns  = float(fp - ss) * TAP_NS
-        total_a  = float(np.sum(amp_cl))
+        total_p  = float(np.sum(pow_cl))
 
-        med = float(np.sum((t_cl - t_fp_ns) * amp_cl) / total_a)
-        rds = float(np.sqrt(
-            np.sum(amp_cl * (t_cl - t_fp_ns - med) ** 2) / total_a
-        ))
+        if total_p > 1e-18:
+            med = float(np.sum((t_cl - t_fp_ns) * pow_cl) / total_p)
+            rds = float(np.sqrt(
+                np.sum(pow_cl * (t_cl - t_fp_ns - med) ** 2) / total_p
+            ))
+        else:
+            med = rds = 0.0
         kurt     = float(_sp_kurtosis(amp_cl, fisher=True))
         skewness = float(_sp_skew(amp_cl))
     else:
@@ -106,6 +113,7 @@ def compute_features_from_cir(
         "FPP_dB":               FPP_dB,
         "RXP_dB":               RXP_dB,
         "RXP_minus_FPP_dB":     RXP_minus_FPP_dB,
+        "FP_SNR_dB":            FP_SNR_dB,
         "PPR_dB":               PPR_dB,
         "rise_time_ns":         rise_time_ns,
         "mean_excess_delay_ns": med,
@@ -127,21 +135,10 @@ def compute_feature_matrix(
     fp_indices: np.ndarray,
     signal_window: int = 150,
 ) -> np.ndarray:
-    """Vectorised helper: features for every sample in a batch.
-
-    Parameters
-    ----------
-    cir_mags : (N, L) float array — magnitude CIRs.
-    fp_indices : (N,) int array   — first-path tap indices.
-
-    Returns
-    -------
-    (N, n_features) float32 array, columns ordered as FEATURE_NAMES.
-    """
+    """Compute recomputed CIR feature matrix for a batch of waveforms."""
     rows = []
     for i in range(len(cir_mags)):
         d = compute_features_from_cir(cir_mags[i], int(fp_indices[i]),
                                       signal_window=signal_window)
         rows.append([d[k] for k in FEATURE_NAMES])
     return np.array(rows, dtype=np.float32)
-

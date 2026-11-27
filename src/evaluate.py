@@ -1,16 +1,16 @@
-"""evaluate.py — Floor-Wall sweep: inject Phantom-NLOS into clean LOS CIRs,
-measure bias shift and NLOS classifier flip rates.
+"""evaluate.py — Floor-Wall sweep on Fontaine IIoT19 + Complex I/Q DW3000 & IIoT20 checks.
 
-Operates in two modes:
-1. **Full CIR mode** (CIRsV2.hdf5 available): inject into actual CIR waveforms,
-   recompute features, run ALL models (LightGBM-CSV, LightGBM-CIR, CNN, AE, APS006).
-2. **Analytical mode** (no CIR waveforms): simulate the effect of injection on
-   CIR-derived scalar features analytically and evaluate LightGBM-CSV + APS006.
+Evaluates whether injecting a delayed LOS copy at Δt ∈ [10, 60] ns capped at
++0, +3, +6, +9, +12 dB while leaving the LOS first path completely untouched can:
+  1. Shift UWB ML ranging-bias regressors by > 0.5 m (indirect distance reduction), AND/OR
+  2. Flip UWB NLOS classifiers from LOS to NLOS (stealthy anchor exclusion).
 
-Sweep parameters:
-   delta_t_ns  ∈ {10, 20, 35, 50, 60}
-   power_dB    ∈ {0, 3, 6, 9, 12}
-   regimes     ∈ {A, B} (PAC-normalized, per-sample max-normalized)
+Outputs:
+  - results/floor_wall_summary.csv     (Fontaine IIoT19 full sweep: Regimes A & B + analytical)
+  - results/dw3000_complex_summary.csv (Santamaria DW3000 complex-IQ 5-phase avg & phi=0)
+  - results/bias_shift_vs_power.png
+  - results/nlos_flip_rate_vs_power.png
+  - results/sample_cir_overlay.png
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ import sys
 import warnings
 from pathlib import Path
 
-import lightgbm as lgb
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -30,14 +29,16 @@ import numpy as np
 import pandas as pd
 import torch
 
+torch.set_num_threads(2)
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from dataset import (CNN_WIN_LEN, extract_cir_window, grouped_split,
-                     load_fontaine_cirs, load_fontaine_scalar)
-from features import FEATURE_NAMES, compute_features_from_cir
-from injector import inject_phantom_nlos
+from dataset import (CNN_WIN_LEN, extract_cir_window, load_fontaine_cirs,
+                     load_fontaine_iiot20, load_fontaine_scalar,
+                     load_santamaria_dw3000)
+from features import FEATURE_NAMES, TAP_NS, compute_feature_matrix, compute_features_from_cir
+from injector import inject_phantom_nlos, inject_with_phase_averaging
 from models import (AECNNRegressor, APS006Classifier, CNN1DClassifier,
-                    CNN1DRegressor, CIR_DERIVED_COLS, CIRAutoencoder,
-                    SCALAR_FEATURE_COLS)
+                    CNN1DRegressor, CIRAutoencoder, SCALAR_FEATURE_COLS)
 
 warnings.filterwarnings("ignore")
 
@@ -68,7 +69,9 @@ def load_pickle(name: str):
 
 def load_torch(cls, name: str, **kwargs):
     model = cls(**kwargs)
-    model.load_state_dict(torch.load(MODELS_DIR / f"{name}.pt", map_location=DEVICE, weights_only=True))
+    model.load_state_dict(
+        torch.load(MODELS_DIR / f"{name}.pt", map_location=DEVICE, weights_only=True)
+    )
     model.eval()
     return model
 
@@ -77,56 +80,178 @@ def _sigmoid(x):
     return 1.0 / (1.0 + np.exp(-np.clip(x, -50, 50)))
 
 
-# ============================================================
-#  Analytical feature simulation (fallback when no CIR)
-# ============================================================
+def _norm_windows(cirs_mag: np.ndarray, fp_arr: np.ndarray, regime: str, scale_A: float) -> np.ndarray:
+    wins = np.stack([
+        extract_cir_window(cirs_mag[i], int(fp_arr[i]))
+        for i in range(len(cirs_mag))
+    ]).astype(np.float32)
+    if regime == "A":
+        return (wins / np.float32(max(scale_A, 1e-12))).astype(np.float32)
+    mx = np.maximum(wins.max(axis=1, keepdims=True), 1e-12)
+    return (wins / mx).astype(np.float32)
 
-def simulate_injection_on_features(
-    row: pd.Series,
-    delta_t_ns: float,
-    power_db: float,
-) -> dict:
-    """Estimate how injecting a delayed pulse changes CSV scalar features.
 
-    Physics:  The injected pulse adds power but does NOT change the first
-    path.  Therefore:
-      - FP_power (dBm) unchanged.
-      - RX_power (dBm) increases: RX_lin_new = RX_lin_old + fp_lin · scale²
-      - Pd (= RX_power - FP_power, dB) increases.
-      - CIRpower (raw register ∝ total energy) increases proportionally.
-      - fp_ampl1/2/3, std_noise, RXPACC unchanged.
-      - Pr (channel parameter) increases with RX_power.
-
-    Note: RX_power and FP_power are already in dBm (~-80 to -115).
-          CIRpower is a raw register value (~10k), NOT in dB.
-    """
+def simulate_injection_on_features(row: pd.Series, power_db: float) -> dict:
+    """Analytical scalar approximation used only as CSV baseline reference."""
     scale = 10.0 ** (power_db / 20.0)
-
-    # Current values (RX_power, FP_power are in dBm)
-    FP_power = float(row["FP_power"])   # dBm
-    RX_power = float(row["RX_power"])   # dBm
-    CIRpower = float(row["CIRpower"])   # raw register (linear proxy)
-
-    # Convert dBm to linear milliwatts for addition
-    fp_lin = 10.0 ** (FP_power / 10.0)  # milliwatts
-    rx_lin = 10.0 ** (RX_power / 10.0)  # milliwatts
-    inj_lin = fp_lin * (scale ** 2)      # injected power (milliwatts)
-
-    rx_lin_new = rx_lin + inj_lin
-    RX_power_new = 10.0 * np.log10(max(rx_lin_new, 1e-300))
-    Pd_new = RX_power_new - FP_power
-
-    # CIRpower is a raw register proportional to total energy.
-    # Injection adds energy proportional to fp_lin * scale^2 / rx_lin * CIRpower
-    CIRpower_new = CIRpower * (rx_lin_new / max(rx_lin, 1e-300))
+    fp_p = float(row["FP_power"])
+    rx_p = float(row["RX_power"])
+    cir_p = float(row["CIRpower"])
+    fp_lin = 10.0 ** (fp_p / 10.0)
+    rx_lin = 10.0 ** (rx_p / 10.0)
+    rx_new = rx_lin + fp_lin * (scale ** 2)
+    rx_p_new = 10.0 * np.log10(max(rx_new, 1e-300))
 
     new_row = row.copy()
-    new_row["RX_power"]  = RX_power_new
-    new_row["CIRpower"]  = CIRpower_new
-    new_row["Pd"]        = Pd_new
-    new_row["Pr"]        = float(row["Pr"]) + (RX_power_new - RX_power)
-
+    new_row["RX_power"] = rx_p_new
+    new_row["CIRpower"] = cir_p * (rx_new / max(rx_lin, 1e-300))
+    new_row["Pd"]       = rx_p_new - fp_p
+    new_row["Pr"]       = float(row["Pr"]) + (rx_p_new - rx_p)
     return {col: float(new_row[col]) for col in SCALAR_FEATURE_COLS}
+
+
+# ============================================================
+#  Santamaria DW3000 & IIoT20 Complex-IQ Evaluation
+# ============================================================
+
+def evaluate_dw3000_complex(
+    aps006: APS006Classifier,
+    lgbm_cls_cir,
+    cnn_cls_A,
+    cnn_cls_B,
+    scale_A: float,
+    fontaine_los_med_peak: float,
+) -> pd.DataFrame | None:
+    """Test real DW3000 complex-I/Q CIRs under 5 random phase draws + phi=0.
+
+    Uses calibration_anc0/anchors (all LOS) + clean APS006-LOS links from
+    lab/corridor (RXP_minus_FPP_dB < 6.0). Never touches DW3000 range errors.
+    """
+    recs = []
+    for scen in ["calibration_anc0", "calibration_anchors", "lab", "corridor"]:
+        for r in load_santamaria_dw3000(scen):
+            r["scenario"] = scen
+            recs.append(r)
+    if not recs:
+        logger.warning("No Santamaria DW3000 records found; skipping complex-IQ DW3000 test.")
+        return None
+
+    # Compute baseline clean APS006 features from raw complex magnitude
+    clean_los_recs = []
+    for r in recs:
+        f = compute_features_from_cir(r["cir_mag"], r["fpi"])
+        # Calibration captures are physically LOS (<10 dB); lab/corridor filter <6 dB
+        thr = 10.0 if r["scenario"].startswith("calibration") else 6.0
+        if f["RXP_minus_FPP_dB"] < thr:
+            r["clean_feats"] = f
+            clean_los_recs.append(r)
+
+    if len(clean_los_recs) == 0:
+        return None
+
+    # Deterministic subsample of up to 250 clean DW3000 LOS CIRs across scenarios
+    rng = np.random.RandomState(SEED)
+    if len(clean_los_recs) > 250:
+        idx_sub = np.sort(rng.choice(len(clean_los_recs), size=250, replace=False))
+        clean_los_recs = [clean_los_recs[i] for i in idx_sub]
+
+    n_dw = len(clean_los_recs)
+    # Match PAC scale ratio between DW3000 (N-divided) and Fontaine Regime A
+    dw_pac_med = float(np.median([r["cir_mag_pac"].max() for r in clean_los_recs]))
+    dw_to_fontaine = fontaine_los_med_peak / max(dw_pac_med, 1e-6)
+    dw_scale_A = scale_A / max(dw_to_fontaine, 1e-6)
+
+    logger.info(
+        "=== Santamaria DW3000 Complex-IQ Evaluation (%d clean LOS CIRs across scenarios; "
+        "no ranging-error regression!) ===",
+        n_dw,
+    )
+
+    clean_fmat = np.array([
+        [compute_features_from_cir(r["cir_mag_pac"] * dw_to_fontaine, r["fpi"])[k]
+         for k in FEATURE_NAMES]
+        for r in clean_los_recs
+    ], dtype=np.float32)
+    clean_pd = clean_fmat[:, FEATURE_NAMES.index("RXP_minus_FPP_dB")]
+    clean_aps10 = aps006.predict(clean_pd)
+    clean_aps6  = aps006.predict_flagged(clean_pd)
+
+    # Clean CNN-Cls & LGBM-Cls baselines on DW3000 (domain-transferred classifiers)
+    clean_lgbm_p = lgbm_cls_cir.predict(clean_fmat) if lgbm_cls_cir is not None else None
+    dw_pac_mags = np.stack([r["cir_mag_pac"] for r in clean_los_recs])
+    dw_fp_arr   = np.array([r["fpi"] for r in clean_los_recs], dtype=int)
+    wA_clean = _norm_windows(dw_pac_mags, dw_fp_arr, "A", dw_scale_A)
+    wB_clean = _norm_windows(dw_pac_mags, dw_fp_arr, "B", 1.0)
+    with torch.no_grad():
+        clean_cnnA_p = _sigmoid(cnn_cls_A(torch.tensor(wA_clean).unsqueeze(1)).numpy()) if cnn_cls_A else None
+        clean_cnnB_p = _sigmoid(cnn_cls_B(torch.tensor(wB_clean).unsqueeze(1)).numpy()) if cnn_cls_B else None
+
+    rows = []
+    for dt in DELTA_T_NS:
+        for pdb in POWER_DB:
+            # 5 random phase draws averaged per sample + worst-case constructive phi=0
+            draw_aps10 = np.zeros((5, n_dw))
+            draw_aps6  = np.zeros((5, n_dw))
+            draw_lgbm  = np.zeros((5, n_dw))
+            draw_cnnA  = np.zeros((5, n_dw))
+            draw_cnnB  = np.zeros((5, n_dw))
+
+            worst_fmat = []
+            per_draw_mags = [[] for _ in range(5)]
+            for i, r in enumerate(clean_los_recs):
+                _, mag_w, mags5 = inject_with_phase_averaging(
+                    r["cir_complex"], r["fpi"], dt, pdb, n_phase_draws=5, seed=SEED + i,
+                )
+                fw = compute_features_from_cir((mag_w / r["N"]) * dw_to_fontaine, r["fpi"])
+                worst_fmat.append([fw[k] for k in FEATURE_NAMES])
+                for d_idx in range(5):
+                    per_draw_mags[d_idx].append(mags5[d_idx])
+
+            for d_idx in range(5):
+                mags_d = per_draw_mags[d_idx]
+                fmat_d = np.array([
+                    [compute_features_from_cir((mags_d[i] / clean_los_recs[i]["N"]) * dw_to_fontaine,
+                                               clean_los_recs[i]["fpi"])[k]
+                     for k in FEATURE_NAMES]
+                    for i in range(n_dw)
+                ], dtype=np.float32)
+                pd_d = fmat_d[:, FEATURE_NAMES.index("RXP_minus_FPP_dB")]
+                draw_aps10[d_idx] = (clean_aps10 == 0) & (aps006.predict(pd_d) == 1)
+                draw_aps6[d_idx]  = (clean_aps6 == 0)  & (aps006.predict_flagged(pd_d) == 1)
+                if clean_lgbm_p is not None:
+                    draw_lgbm[d_idx] = (clean_lgbm_p < 0.5) & (lgbm_cls_cir.predict(fmat_d) >= 0.5)
+                pac_d = np.stack([mags_d[i] / clean_los_recs[i]["N"] for i in range(n_dw)])
+                if clean_cnnA_p is not None:
+                    wA = _norm_windows(pac_d, dw_fp_arr, "A", dw_scale_A)
+                    with torch.no_grad():
+                        pA = _sigmoid(cnn_cls_A(torch.tensor(wA).unsqueeze(1)).numpy())
+                    draw_cnnA[d_idx] = (clean_cnnA_p < 0.5) & (pA >= 0.5)
+                if clean_cnnB_p is not None:
+                    wB = _norm_windows(pac_d, dw_fp_arr, "B", 1.0)
+                    with torch.no_grad():
+                        pB = _sigmoid(cnn_cls_B(torch.tensor(wB).unsqueeze(1)).numpy())
+                    draw_cnnB[d_idx] = (clean_cnnB_p < 0.5) & (pB >= 0.5)
+
+            worst_fmat_arr = np.array(worst_fmat, dtype=np.float32)
+            worst_pd = worst_fmat_arr[:, FEATURE_NAMES.index("RXP_minus_FPP_dB")]
+            row = {
+                "delta_t_ns": dt,
+                "power_dB": pdb,
+                "flip_dw3000_aps10_phase5_avg": float(draw_aps10.mean()),
+                "flip_dw3000_aps6_phase5_avg":  float(draw_aps6.mean()),
+                "flip_dw3000_aps10_phi0":       float(np.mean((clean_aps10 == 0) & (aps006.predict(worst_pd) == 1))),
+                "flip_dw3000_aps6_phi0":        float(np.mean((clean_aps6 == 0)  & (aps006.predict_flagged(worst_pd) == 1))),
+                "flip_dw3000_lgbm_phase5_avg":  float(draw_lgbm.mean()) if clean_lgbm_p is not None else np.nan,
+                "flip_dw3000_cnnA_phase5_avg":  float(draw_cnnA.mean()) if clean_cnnA_p is not None else np.nan,
+                "flip_dw3000_cnnB_phase5_avg":  float(draw_cnnB.mean()) if clean_cnnB_p is not None else np.nan,
+            }
+            rows.append(row)
+
+    df_dw = pd.DataFrame(rows)
+    out_p = RESULTS_DIR / "dw3000_complex_summary.csv"
+    df_dw.to_csv(out_p, index=False, float_format="%.6f")
+    logger.info("Saved %s (%d rows)", out_p, len(df_dw))
+    return df_dw
 
 
 # ============================================================
@@ -137,305 +262,278 @@ def main() -> int:
     np.random.seed(SEED)
     RESULTS_DIR.mkdir(exist_ok=True)
 
-    # ---- Load data & splits ----
-    logger.info("=== Loading data ===")
+    # ---- Load Fontaine IIoT19 data & splits ----
+    logger.info("=== Loading Fontaine IIoT19 data & splits ===")
     df = load_fontaine_scalar()
     splits = load_pickle("split_indices")
     te_idx = splits["test"]
     train_meta = load_pickle("train_meta")
-    have_cirs = train_meta["have_cirs"]
+    have_cirs = bool(train_meta.get("have_cirs", False))
+    scale_A = float(train_meta.get("scale_A", 1.0))
 
-    # Select clean LOS test samples only
     te_df = df.iloc[te_idx].copy()
-    te_df["_orig_idx"] = te_idx  # keep track of original index
+    te_df["_orig_idx"] = te_idx
     los_mask = te_df["label"] == 0
     los_df = te_df[los_mask].copy()
     los_orig_idx = te_df[los_mask]["_orig_idx"].values
+    n_los = len(los_df)
+    logger.info("Held-out test set: %d total (%d LOS, %d NLOS)",
+                len(te_df), n_los, int((~los_mask).sum()))
 
-    logger.info("Test set: %d samples (%d LOS, %d NLOS)",
-                len(te_df), los_mask.sum(), (~los_mask).sum())
+    # ---- Load CSV baseline models ----
+    lgbm_reg_csv = load_pickle("lgbm_reg_csv")
+    lgbm_cls_csv = load_pickle("lgbm_cls_csv")
+    aps006       = APS006Classifier()
 
-    if len(los_df) == 0:
-        logger.error("No LOS samples in test set! Cannot run floor-wall evaluation.")
-        return 1
-
-    # ---- Load models ----
-    logger.info("=== Loading trained models ===")
-    lgbm_reg = load_pickle("lgbm_reg_csv")
-    lgbm_cls = load_pickle("lgbm_cls_csv")
-    aps006   = APS006Classifier()
-
-    # Compute clean predictions on LOS test samples (CSV features)
     X_los_csv = los_df[SCALAR_FEATURE_COLS].values.astype(np.float32)
-    clean_reg_pred_csv = lgbm_reg.predict(X_los_csv)  # mm
-    clean_cls_pred_csv = lgbm_cls.predict(X_los_csv)  # probability
-    clean_aps_pred     = aps006.predict(los_df["Pd"].values)
-    clean_aps_flag     = aps006.predict_flagged(los_df["Pd"].values)
+    clean_reg_pred_csv = lgbm_reg_csv.predict(X_los_csv)
+    clean_cls_pred_csv = lgbm_cls_csv.predict(X_los_csv)
+    clean_aps_csv_10   = aps006.predict(los_df["Pd"].values)
+    clean_aps_csv_6    = aps006.predict_flagged(los_df["Pd"].values)
 
-    # CIR-based models
-    cirs = None
+    # ---- Load CIR-based models ----
+    cirs, fp_cir_all, is_complex = load_fontaine_cirs(key="IIoT19", n_expected=len(df)) if have_cirs else (None, None, False)
     lgbm_reg_cir = lgbm_cls_cir = None
-    cnn_models = {}  # {f"cnn_reg_{regime}": model, ...}
-
-    if have_cirs:
-        cirs = load_fontaine_cirs(n_expected=len(df))
+    cnn_models: dict[str, torch.nn.Module] = {}
 
     if cirs is not None:
         cir_mags = np.abs(cirs)
-        fp_indices = df["fpi"].values
-
-        try:
-            lgbm_reg_cir = load_pickle("lgbm_reg_cir")
-            lgbm_cls_cir = load_pickle("lgbm_cls_cir")
-        except FileNotFoundError:
-            pass
-
-        for regime in ["A", "B"]:
-            for mtype, cls_obj, kw in [
-                ("cnn_reg", CNN1DRegressor, {"input_len": CNN_WIN_LEN}),
-                ("cnn_cls", CNN1DClassifier, {"input_len": CNN_WIN_LEN}),
-            ]:
-                name = f"{mtype}_{regime}"
-                try:
-                    cnn_models[name] = load_torch(cls_obj, name, **kw)
-                except FileNotFoundError:
-                    logger.warning("Model %s not found, skipping.", name)
-
-            # AE+Reg
-            ae_name = f"ae_{regime}"
-            ae_reg_name = f"ae_reg_{regime}"
-            try:
-                ae = CIRAutoencoder(input_len=CNN_WIN_LEN)
-                ae.load_state_dict(torch.load(MODELS_DIR / f"{ae_name}.pt",
-                                              map_location=DEVICE, weights_only=True))
-                ae.eval()
-                ae_reg = AECNNRegressor(ae.encoder)
-                ae_reg.load_state_dict(torch.load(MODELS_DIR / f"{ae_reg_name}.pt",
-                                                  map_location=DEVICE, weights_only=True))
-                ae_reg.eval()
-                cnn_models[ae_reg_name] = ae_reg
-            except FileNotFoundError:
-                logger.warning("AE model %s not found, skipping.", ae_reg_name)
-
-        # Clean CIR-derived predictions
+        los_cirs = cirs[los_orig_idx]
         los_cir_mags = cir_mags[los_orig_idx]
-        los_fp_idx   = fp_indices[los_orig_idx]
+        los_fp_arr = fp_cir_all[los_orig_idx]
+        fontaine_los_med_peak = float(np.median(los_cir_mags.max(axis=1)))
 
-        if lgbm_reg_cir is not None:
-            feat_los = np.stack([
-                list(compute_features_from_cir(los_cir_mags[i], int(los_fp_idx[i])).values())
-                for i in range(len(los_cir_mags))
-            ]).astype(np.float32)
-            clean_reg_cir_pred = lgbm_reg_cir.predict(feat_los)
-            clean_cls_cir_pred = lgbm_cls_cir.predict(feat_los)
-        else:
-            clean_reg_cir_pred = clean_cls_cir_pred = None
+        lgbm_reg_cir = load_pickle("lgbm_reg_cir")
+        lgbm_cls_cir = load_pickle("lgbm_cls_cir")
+        for regime in ["A", "B"]:
+            cnn_models[f"cnn_reg_{regime}"] = load_torch(CNN1DRegressor, f"cnn_reg_{regime}", input_len=CNN_WIN_LEN)
+            cnn_models[f"cnn_cls_{regime}"] = load_torch(CNN1DClassifier, f"cnn_cls_{regime}", input_len=CNN_WIN_LEN)
+            ae = load_torch(CIRAutoencoder, f"ae_{regime}", input_len=CNN_WIN_LEN)
+            ae_reg = AECNNRegressor(ae.encoder)
+            ae_reg.load_state_dict(torch.load(MODELS_DIR / f"ae_reg_{regime}.pt", map_location=DEVICE, weights_only=True))
+            ae_reg.eval()
+            cnn_models[f"ae_reg_{regime}"] = ae_reg
 
-        # Clean CNN predictions per regime
+        # Clean baselines on LOS test samples (computed ONCE)
+        feat_los_clean = compute_feature_matrix(los_cir_mags, los_fp_arr)
+        clean_reg_cir_pred = lgbm_reg_cir.predict(feat_los_clean)
+        clean_cls_cir_pred = lgbm_cls_cir.predict(feat_los_clean)
+        rxp_fpp_clean = feat_los_clean[:, FEATURE_NAMES.index("RXP_minus_FPP_dB")]
+        clean_aps_cir_10 = aps006.predict(rxp_fpp_clean)
+        clean_aps_cir_6  = aps006.predict_flagged(rxp_fpp_clean)
+
         clean_cnn_preds = {}
         for regime in ["A", "B"]:
-            windows = np.stack([
-                extract_cir_window(los_cir_mags[i], int(los_fp_idx[i]))
-                for i in range(len(los_cir_mags))
-            ]).astype(np.float32)
-            if regime == "B":
-                mx = windows.max(axis=1, keepdims=True)
-                mx = np.maximum(mx, 1e-12)
-                windows = windows / mx
-            xt = torch.tensor(windows, dtype=torch.float32).unsqueeze(1)
-
+            w_clean = _norm_windows(los_cir_mags, los_fp_arr, regime, scale_A)
+            xt = torch.tensor(w_clean).unsqueeze(1)
             for mname, model in cnn_models.items():
                 if mname.endswith(f"_{regime}"):
                     with torch.no_grad():
-                        p = model(xt).numpy()
-                    clean_cnn_preds[mname] = p
-
-        logger.info("Loaded %d CNN/AE models for CIR evaluation.", len(cnn_models))
+                        clean_cnn_preds[mname] = model(xt).numpy()
     else:
-        logger.info("No CIR waveforms — using analytical feature simulation only.")
+        fontaine_los_med_peak = 15.0
 
-    # ---- Floor-Wall Sweep ----
-    logger.info("=== Starting Floor-Wall Sweep ===")
+    # ---- Floor-Wall Sweep on Fontaine IIoT19 ----
+    logger.info("=== Running Floor-Wall Sweep on %d clean LOS test CIRs ===", n_los)
     results = []
-    n_los = len(los_df)
 
     for dt in DELTA_T_NS:
         for pdb in POWER_DB:
-            logger.info("--- delta_t=%d ns, power=%+d dB ---", dt, pdb)
-
-            # -- Mode 1: Analytical (always available) --
-            atk_features_csv = []
-            for _, row in los_df.iterrows():
-                sim = simulate_injection_on_features(row, dt, pdb)
-                atk_features_csv.append([sim[c] for c in SCALAR_FEATURE_COLS])
-            X_atk_csv = np.array(atk_features_csv, dtype=np.float32)
-
-            atk_reg_csv = lgbm_reg.predict(X_atk_csv)
-            atk_cls_csv = lgbm_cls.predict(X_atk_csv)
-            # Simulated Pd for APS006
-            atk_Pd = X_atk_csv[:, SCALAR_FEATURE_COLS.index("Pd")]
-            atk_aps  = aps006.predict(atk_Pd)
-            atk_aps_flag = aps006.predict_flagged(atk_Pd)
-
-            # Bias shift (meters)
-            delta_b_csv = (atk_reg_csv - clean_reg_pred_csv) / 1000.0
-
-            row_base = {
+            # 1) Analytical CSV reference
+            X_atk_csv = np.array([
+                [simulate_injection_on_features(row, pdb)[c] for c in SCALAR_FEATURE_COLS]
+                for _, row in los_df.iterrows()
+            ], dtype=np.float32)
+            atk_reg_csv = lgbm_reg_csv.predict(X_atk_csv)
+            atk_cls_csv = lgbm_cls_csv.predict(X_atk_csv)
+            atk_pd_csv  = X_atk_csv[:, SCALAR_FEATURE_COLS.index("Pd")]
+            db_csv = (atk_reg_csv - clean_reg_pred_csv) / 1000.0
+            results.append({
                 "delta_t_ns": dt, "power_dB": pdb, "regime": "analytical",
-            }
-            # Regressor metrics
-            row_base["mean_delta_b_m_lgbm_csv"] = float(np.mean(delta_b_csv))
-            row_base["median_delta_b_m_lgbm_csv"] = float(np.median(delta_b_csv))
-            row_base["p90_delta_b_m_lgbm_csv"] = float(np.percentile(delta_b_csv, 90))
-            row_base["ASR_020m_lgbm_csv"] = float(np.mean(delta_b_csv > 0.20))
-            row_base["ASR_050m_lgbm_csv"] = float(np.mean(delta_b_csv > 0.50))
-            row_base["ASR_100m_lgbm_csv"] = float(np.mean(delta_b_csv > 1.00))
-            # Classifier metrics
-            row_base["flip_aps006_10dB"] = float(np.mean(
-                (clean_aps_pred == 0) & (atk_aps == 1)))
-            row_base["flip_aps006_6dB"] = float(np.mean(
-                (clean_aps_flag == 0) & (atk_aps_flag == 1)))
-            row_base["flip_lgbm_cls_csv"] = float(np.mean(
-                (clean_cls_pred_csv < 0.5) & (atk_cls_csv >= 0.5)))
+                "mean_delta_b_m_lgbm_csv":   float(np.mean(db_csv)),
+                "median_delta_b_m_lgbm_csv": float(np.median(db_csv)),
+                "p90_delta_b_m_lgbm_csv":    float(np.percentile(db_csv, 90)),
+                "ASR_020m_lgbm_csv":         float(np.mean(db_csv > 0.20)),
+                "ASR_050m_lgbm_csv":         float(np.mean(db_csv > 0.50)),
+                "ASR_100m_lgbm_csv":         float(np.mean(db_csv > 1.00)),
+                "flip_aps006_10dB":          float(np.mean((clean_aps_csv_10 == 0) & (aps006.predict(atk_pd_csv) == 1))),
+                "flip_aps006_6dB":           float(np.mean((clean_aps_csv_6 == 0)  & (aps006.predict_flagged(atk_pd_csv) == 1))),
+                "flip_lgbm_cls_csv":         float(np.mean((clean_cls_pred_csv < 0.5) & (atk_cls_csv >= 0.5))),
+            })
 
-            results.append(row_base)
+            if cirs is None:
+                continue
 
-            # -- Mode 2: CIR-based (if available) --
-            if cirs is not None:
-                los_cirs_complex = cirs[los_orig_idx]
-                los_cir_mags_arr = np.abs(los_cirs_complex)
-                los_fp_arr = df["fpi"].values[los_orig_idx]
+            # 2) Physics-accurate waveform injection ONCE per (dt, pdb)
+            atk_mags = np.stack([
+                np.abs(inject_phantom_nlos(
+                    los_cirs[i], int(los_fp_arr[i]), dt, pdb,
+                    is_complex=is_complex, phi=0.0 if is_complex else None,
+                ))
+                for i in range(n_los)
+            ])
+            atk_fmat = compute_feature_matrix(atk_mags, los_fp_arr)
+            atk_reg_cir = lgbm_reg_cir.predict(atk_fmat)
+            atk_cls_cir = lgbm_cls_cir.predict(atk_fmat)
+            db_lgbm_cir = (atk_reg_cir - clean_reg_cir_pred) / 1000.0
+            rxp_fpp_atk = atk_fmat[:, FEATURE_NAMES.index("RXP_minus_FPP_dB")]
 
-                for regime in ["A", "B"]:
-                    # Inject into each LOS CIR
-                    atk_mags = []
-                    atk_feats = []
-                    for i in range(n_los):
-                        fp_i = int(los_fp_arr[i])
-                        h_atk = inject_phantom_nlos(
-                            los_cirs_complex[i], fp_i, dt, pdb,
-                            is_complex=True, phi=0.0,  # worst-case constructive
-                        )
-                        mag_atk = np.abs(h_atk)
-                        atk_mags.append(mag_atk)
-                        f_dict = compute_features_from_cir(mag_atk, fp_i)
-                        atk_feats.append([f_dict[k] for k in FEATURE_NAMES])
+            for regime in ["A", "B"]:
+                atk_windows = _norm_windows(atk_mags, los_fp_arr, regime, scale_A)
+                xt_atk = torch.tensor(atk_windows).unsqueeze(1)
 
-                    atk_mags = np.array(atk_mags)
-                    atk_feat_matrix = np.array(atk_feats, dtype=np.float32)
+                r = {
+                    "delta_t_ns": dt,
+                    "power_dB": pdb,
+                    "regime": regime,
+                    "mean_delta_b_m_lgbm_cir":   float(np.mean(db_lgbm_cir)),
+                    "median_delta_b_m_lgbm_cir": float(np.median(db_lgbm_cir)),
+                    "p90_delta_b_m_lgbm_cir":    float(np.percentile(db_lgbm_cir, 90)),
+                    "ASR_020m_lgbm_cir":         float(np.mean(db_lgbm_cir > 0.20)),
+                    "ASR_050m_lgbm_cir":         float(np.mean(db_lgbm_cir > 0.50)),
+                    "ASR_100m_lgbm_cir":         float(np.mean(db_lgbm_cir > 1.00)),
+                    "flip_lgbm_cls_cir":         float(np.mean((clean_cls_cir_pred < 0.5) & (atk_cls_cir >= 0.5))),
+                    "flip_aps006_cir_10dB":      float(np.mean((clean_aps_cir_10 == 0) & (aps006.predict(rxp_fpp_atk) == 1))),
+                    "flip_aps006_cir_6dB":       float(np.mean((clean_aps_cir_6 == 0)  & (aps006.predict_flagged(rxp_fpp_atk) == 1))),
+                }
 
-                    # Windows for CNN
-                    atk_windows = np.stack([
-                        extract_cir_window(atk_mags[i], int(los_fp_arr[i]))
-                        for i in range(n_los)
-                    ]).astype(np.float32)
-                    if regime == "B":
-                        mx = atk_windows.max(axis=1, keepdims=True)
-                        mx = np.maximum(mx, 1e-12)
-                        atk_windows = atk_windows / mx
+                for base_name in ["cnn_reg", "cnn_cls", "ae_reg"]:
+                    mname = f"{base_name}_{regime}"
+                    model = cnn_models[mname]
+                    with torch.no_grad():
+                        p_atk = model(xt_atk).numpy()
+                    p_clean = clean_cnn_preds[mname]
+                    if "reg" in base_name:
+                        db = p_atk - p_clean
+                        r[f"mean_delta_b_m_{base_name}"]   = float(np.mean(db))
+                        r[f"median_delta_b_m_{base_name}"] = float(np.median(db))
+                        r[f"p90_delta_b_m_{base_name}"]    = float(np.percentile(db, 90))
+                        r[f"ASR_020m_{base_name}"]         = float(np.mean(db > 0.20))
+                        r[f"ASR_050m_{base_name}"]         = float(np.mean(db > 0.50))
+                        r[f"ASR_100m_{base_name}"]         = float(np.mean(db > 1.00))
+                    else:
+                        r[f"flip_{base_name}"] = float(np.mean((_sigmoid(p_clean) < 0.5) & (_sigmoid(p_atk) >= 0.5)))
 
-                    r = {"delta_t_ns": dt, "power_dB": pdb, "regime": regime}
+                results.append(r)
 
-                    # LightGBM CIR-derived regressor
-                    if lgbm_reg_cir is not None:
-                        atk_reg_cir = lgbm_reg_cir.predict(atk_feat_matrix)
-                        delta_b_cir = (atk_reg_cir - clean_reg_cir_pred) / 1000.0
-                        r["mean_delta_b_m_lgbm_cir"] = float(np.mean(delta_b_cir))
-                        r["median_delta_b_m_lgbm_cir"] = float(np.median(delta_b_cir))
-                        r["p90_delta_b_m_lgbm_cir"] = float(np.percentile(delta_b_cir, 90))
-                        r["ASR_020m_lgbm_cir"] = float(np.mean(delta_b_cir > 0.20))
-                        r["ASR_050m_lgbm_cir"] = float(np.mean(delta_b_cir > 0.50))
-                        r["ASR_100m_lgbm_cir"] = float(np.mean(delta_b_cir > 1.00))
-
-                    if lgbm_cls_cir is not None:
-                        atk_cls_cir = lgbm_cls_cir.predict(atk_feat_matrix)
-                        r["flip_lgbm_cls_cir"] = float(np.mean(
-                            (clean_cls_cir_pred < 0.5) & (atk_cls_cir >= 0.5)))
-
-                    # APS006 from CIR-derived RXP-FPP
-                    rxp_fpp_atk = atk_feat_matrix[:, FEATURE_NAMES.index("RXP_minus_FPP_dB")]
-                    feat_los_clean = np.stack([
-                        list(compute_features_from_cir(
-                            los_cir_mags_arr[i], int(los_fp_arr[i])).values())
-                        for i in range(n_los)
-                    ]).astype(np.float32)
-                    rxp_fpp_clean = feat_los_clean[:, FEATURE_NAMES.index("RXP_minus_FPP_dB")]
-                    clean_aps_cir = (rxp_fpp_clean > 10.0).astype(int)
-                    atk_aps_cir   = (rxp_fpp_atk > 10.0).astype(int)
-                    clean_aps_cir_6 = (rxp_fpp_clean > 6.0).astype(int)
-                    atk_aps_cir_6   = (rxp_fpp_atk > 6.0).astype(int)
-                    r["flip_aps006_cir_10dB"] = float(np.mean(
-                        (clean_aps_cir == 0) & (atk_aps_cir == 1)))
-                    r["flip_aps006_cir_6dB"] = float(np.mean(
-                        (clean_aps_cir_6 == 0) & (atk_aps_cir_6 == 1)))
-
-                    # CNN models
-                    xt_atk = torch.tensor(atk_windows, dtype=torch.float32).unsqueeze(1)
-                    for mname, model in cnn_models.items():
-                        if not mname.endswith(f"_{regime}"):
-                            continue
-                        with torch.no_grad():
-                            p_atk = model(xt_atk).numpy()
-                        p_clean = clean_cnn_preds.get(mname)
-                        if p_clean is None:
-                            continue
-                        if "reg" in mname:
-                            # Predictions are in meters
-                            delta_b = p_atk - p_clean
-                            r[f"mean_delta_b_m_{mname}"] = float(np.mean(delta_b))
-                            r[f"median_delta_b_m_{mname}"] = float(np.median(delta_b))
-                            r[f"p90_delta_b_m_{mname}"] = float(np.percentile(delta_b, 90))
-                            r[f"ASR_050m_{mname}"] = float(np.mean(delta_b > 0.50))
-                        elif "cls" in mname:
-                            prob_clean = _sigmoid(p_clean)
-                            prob_atk   = _sigmoid(p_atk)
-                            r[f"flip_{mname}"] = float(np.mean(
-                                (prob_clean < 0.5) & (prob_atk >= 0.5)))
-
-                    results.append(r)
-
-    # ---- Save CSV ----
     df_res = pd.DataFrame(results)
     csv_path = RESULTS_DIR / "floor_wall_summary.csv"
     df_res.to_csv(csv_path, index=False, float_format="%.6f")
     logger.info("Saved %s (%d rows)", csv_path, len(df_res))
 
-    # ---- Print key results table ----
-    print("\n" + "=" * 80)
-    print("FLOOR-WALL SWEEP RESULTS SUMMARY")
-    print("=" * 80)
-    for _, row in df_res.iterrows():
-        regime = row.get("regime", "?")
-        dt = int(row["delta_t_ns"])
-        pdb = int(row["power_dB"])
-        # Pick best available regressor metric
-        med_key = None
-        for k in ["median_delta_b_m_lgbm_cir", "median_delta_b_m_lgbm_csv"]:
-            if k in row and not pd.isna(row[k]):
-                med_key = k
-                break
-        med_val = f"{row[med_key]:.3f} m" if med_key else "N/A"
-        flip_key = None
-        for k in ["flip_aps006_cir_10dB", "flip_aps006_10dB"]:
-            if k in row and not pd.isna(row[k]):
-                flip_key = k
-                break
-        flip_val = f"{row[flip_key]*100:.1f}%" if flip_key else "N/A"
-        print(f"  Δt={dt:2d}ns  +{pdb:2d}dB  regime={regime:>10s}  "
-              f"median_Δb={med_val:>10s}  APS006_flip={flip_val:>7s}")
+    # ---- Normalization Ablation Summary (Regime B - Regime A) ----
+    if cirs is not None:
+        _print_regime_ablation(df_res)
 
-    # ---- Generate Plots ----
+    # ---- Santamaria DW3000 Complex-IQ Sweep (plus IIoT20 phase check) ----
+    df_dw = None
+    if cirs is not None:
+        df_dw = evaluate_dw3000_complex(
+            aps006, lgbm_cls_cir,
+            cnn_models.get("cnn_cls_A"), cnn_models.get("cnn_cls_B"),
+            scale_A, fontaine_los_med_peak,
+        )
+        _verify_iiot20_complex_phase(aps006)
+
+    # ---- Plots ----
     _plot_bias_shift(df_res)
-    _plot_nlos_flip(df_res)
-    _plot_cir_overlay(df, cirs, los_orig_idx if cirs is not None else None)
+    _plot_nlos_flip(df_res, df_dw)
+    _plot_cir_overlay(df, cirs, fp_cir_all, los_orig_idx if cirs is not None else None)
 
-    # ---- Verdict ----
-    verdict = _compute_verdict(df_res)
-    print("\n" + "=" * 80)
+    # ---- Terminal Summary & Go/No-Go Verdict ----
+    _print_sweep_table(df_res, df_dw)
+    verdict = _compute_verdict(df_res, df_dw)
+    print("\n" + "=" * 82)
     print(verdict)
-    print("=" * 80 + "\n")
-
+    print("=" * 82 + "\n")
     return 0
+
+
+def _verify_iiot20_complex_phase(aps006: APS006Classifier) -> None:
+    """Quick complex-IQ check on Fontaine IIoT20 (5 random phase draws vs phi=0)."""
+    df20, cirs20, fp20 = load_fontaine_iiot20()
+    if cirs20 is None:
+        return
+    sub_idx = np.linspace(0, len(cirs20) - 1, min(300, len(cirs20)), dtype=int)
+    clean_pd = np.array([
+        compute_features_from_cir(np.abs(cirs20[i]), int(fp20[i]))["RXP_minus_FPP_dB"]
+        for i in sub_idx
+    ])
+    c_10 = aps006.predict(clean_pd)
+    c_6  = aps006.predict_flagged(clean_pd)
+    flips_5, flips_0, flips6_5 = [], [], []
+    for i in sub_idx:
+        _, mw, m5 = inject_with_phase_averaging(cirs20[i], int(fp20[i]), 35.0, 6.0, n_phase_draws=5, seed=SEED + int(i))
+        flips_0.append(compute_features_from_cir(mw, int(fp20[i]))["RXP_minus_FPP_dB"] > 10.0)
+        pds = [compute_features_from_cir(m, int(fp20[i]))["RXP_minus_FPP_dB"] for m in m5]
+        flips_5.append(np.mean([p > 10.0 for p in pds]))
+        flips6_5.append(np.mean([p > 6.0 for p in pds]))
+    logger.info(
+        "Fontaine IIoT20 complex128 check (+6 dB, Δt=35 ns, n=%d): "
+        "APS006>10dB flip=%.1f%% (5-phase avg) vs %.1f%% (phi=0) | >6dB flag=%.1f%%",
+        len(sub_idx),
+        100 * np.mean(np.where(c_10 == 0, flips_5, 0)),
+        100 * np.mean((c_10 == 0) & np.array(flips_0)),
+        100 * np.mean(np.where(c_6 == 0, flips6_5, 0)),
+    )
+
+
+def _print_regime_ablation(df_res: pd.DataFrame) -> None:
+    subA = df_res[df_res["regime"] == "A"].set_index(["delta_t_ns", "power_dB"])
+    subB = df_res[df_res["regime"] == "B"].set_index(["delta_t_ns", "power_dB"])
+    if subA.empty or subB.empty:
+        return
+    print("\n" + "=" * 82)
+    print("NORMALIZATION REGIME ABLATION (Regime B per-sample max − Regime A fixed PAC)")
+    print("=" * 82)
+    for pdb in POWER_DB:
+        for mcol, lbl in [("median_delta_b_m_cnn_reg", "CNN-Reg"), ("median_delta_b_m_ae_reg", "AE-Reg")]:
+            if mcol in subA.columns and mcol in subB.columns:
+                mA = subA.xs(pdb, level="power_dB")[mcol].median()
+                mB = subB.xs(pdb, level="power_dB")[mcol].median()
+                print(f"  +{pdb:2d} dB | {lbl:8s}: Regime A={mA:+.3f} m  |  Regime B={mB:+.3f} m  "
+                      f"|  Extra shift (B−A)={mB - mA:+.3f} m")
+
+
+def _print_sweep_table(df_res: pd.DataFrame, df_dw: pd.DataFrame | None) -> None:
+    print("\n" + "=" * 82)
+    print("FLOOR-WALL SWEEP SUMMARY (aggregated over Δt ∈ {10,20,35,50,60} ns)")
+    print("=" * 82)
+    for regime in [r for r in ["A", "B", "analytical"] if r in df_res["regime"].values]:
+        sub = df_res[df_res["regime"] == regime]
+        print(f"\n--- Regime: {regime} ---")
+        for pdb, grp in sub.groupby("power_dB"):
+            parts = []
+            for col, lbl in [
+                ("median_delta_b_m_cnn_reg", "CNN Δb"),
+                ("median_delta_b_m_ae_reg",  "AE Δb"),
+                ("median_delta_b_m_lgbm_cir", "LGBM-CIR Δb"),
+                ("median_delta_b_m_lgbm_csv", "LGBM-CSV Δb"),
+            ]:
+                if col in grp.columns and grp[col].notna().any():
+                    parts.append(f"{lbl}={grp[col].median():+.3f}m")
+            for col, lbl in [
+                ("ASR_050m_cnn_reg", "CNN ASR>0.5"),
+                ("flip_cnn_cls",     "CNN Flip"),
+                ("flip_lgbm_cls_cir", "LGBM Flip"),
+                ("flip_aps006_cir_10dB", "APS>10"),
+                ("flip_aps006_cir_6dB",  "APS>6"),
+                ("flip_aps006_10dB", "APS>10"),
+            ]:
+                if col in grp.columns and grp[col].notna().any():
+                    parts.append(f"{lbl}={grp[col].mean()*100:.1f}%")
+            print(f"  +{pdb:2d} dB | " + " | ".join(parts))
+
+    if df_dw is not None:
+        print("\n--- Santamaria DW3000 Complex-IQ (mean over Δt) ---")
+        for pdb, grp in df_dw.groupby("power_dB"):
+            print(
+                f"  +{pdb:2d} dB | APS>10 (5φ)={grp['flip_dw3000_aps10_phase5_avg'].mean()*100:5.1f}% "
+                f"(φ=0: {grp['flip_dw3000_aps10_phi0'].mean()*100:5.1f}%) | "
+                f"APS>6 (5φ)={grp['flip_dw3000_aps6_phase5_avg'].mean()*100:5.1f}% | "
+                f"LGBM={grp['flip_dw3000_lgbm_phase5_avg'].mean()*100:5.1f}% | "
+                f"CNN-B={grp['flip_dw3000_cnnB_phase5_avg'].mean()*100:5.1f}%"
+            )
 
 
 # ============================================================
@@ -443,45 +541,35 @@ def main() -> int:
 # ============================================================
 
 def _plot_bias_shift(df_res: pd.DataFrame) -> None:
-    """Plot median + IQR of Δb_hat vs power dB."""
     fig, ax = plt.subplots(figsize=(10, 6))
+    ax.axvspan(-0.5, 6.5, color="#e3f2fd", alpha=0.45, label="DW3000 Safe DGC Zone (≤ +6 dB)")
+    ax.axhline(0.5, color="#c62828", linestyle="--", linewidth=1.5, label="0.5 m target shift")
+    ax.axhline(0.0, color="gray", linestyle=":", linewidth=0.8)
 
-    # Shade DGC safe zone
-    ax.axhspan(-0.1, 0.1, xmin=0, xmax=1, color="#e8f5e9", alpha=0.5, label=None)
-    ax.axhline(0.5, color="red", linestyle="--", linewidth=1, label="0.5 m target")
-    ax.axvspan(-0.5, 6.5, color="#e3f2fd", alpha=0.3, label="DGC safe zone (≤+6 dB)")
-
-    regimes_in_data = df_res["regime"].unique()
-    markers = {"analytical": "s", "A": "o", "B": "^"}
-    colors  = {"analytical": "#1565C0", "A": "#2E7D32", "B": "#E65100"}
-
-    for regime in regimes_in_data:
+    curves = [
+        ("A", "median_delta_b_m_cnn_reg",  "CNN-Reg Regime A (PAC)",      "o", "#2E7D32", "-"),
+        ("B", "median_delta_b_m_cnn_reg",  "CNN-Reg Regime B (Max-Peak)", "^", "#E65100", "-"),
+        ("A", "median_delta_b_m_ae_reg",   "AE-Reg Regime A (PAC)",       "s", "#66BB6A", "--"),
+        ("B", "median_delta_b_m_ae_reg",   "AE-Reg Regime B (Max-Peak)",  "d", "#FB8C00", "--"),
+        ("A", "median_delta_b_m_lgbm_cir", "LightGBM-CIR",                "P", "#1565C0", "-."),
+        ("analytical", "median_delta_b_m_lgbm_csv", "LightGBM-CSV (analytical)", "x", "#78909C", ":"),
+    ]
+    for regime, col, label, marker, color, ls in curves:
         sub = df_res[df_res["regime"] == regime]
-        # Find best available median column
-        med_col = None
-        for c in ["median_delta_b_m_lgbm_cir", "median_delta_b_m_cnn_reg_" + regime,
-                   "median_delta_b_m_lgbm_csv"]:
-            if c in sub.columns and sub[c].notna().any():
-                med_col = c
-                break
-        if med_col is None:
+        if sub.empty or col not in sub.columns or sub[col].isna().all():
             continue
-
-        # Aggregate across delta_t for each power_dB
-        grouped = sub.groupby("power_dB")[med_col]
-        medians = grouped.median()
-        q25 = grouped.quantile(0.25)
-        q75 = grouped.quantile(0.75)
-
-        ax.errorbar(medians.index, medians.values,
-                    yerr=[medians.values - q25.values, q75.values - medians.values],
-                    marker=markers.get(regime, "x"), label=f"Regime {regime}",
-                    color=colors.get(regime, "gray"), capsize=4, linewidth=2)
+        grp = sub.groupby("power_dB")[col]
+        med, q25, q75 = grp.median(), grp.quantile(0.25), grp.quantile(0.75)
+        ax.errorbar(
+            med.index, med.values,
+            yerr=[med.values - q25.values, q75.values - med.values],
+            marker=marker, linestyle=ls, color=color, label=label, capsize=3, linewidth=2,
+        )
 
     ax.set_xlabel("Injected Power (dB relative to LOS first path)", fontsize=12)
     ax.set_ylabel("Median Induced Bias Shift Δb̂ (m)", fontsize=12)
-    ax.set_title("Floor-Wall Test: Ranging Bias Shift vs. Attacker Power", fontsize=14)
-    ax.legend(loc="upper left")
+    ax.set_title("Floor-Wall Test: Ranging Bias Shift Across Normalization Regimes", fontsize=13)
+    ax.legend(loc="upper left", fontsize=9)
     ax.set_xticks(POWER_DB)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -490,47 +578,42 @@ def _plot_bias_shift(df_res: pd.DataFrame) -> None:
     plt.close(fig)
 
 
-def _plot_nlos_flip(df_res: pd.DataFrame) -> None:
-    """Plot NLOS classifier flip rate vs power dB."""
+def _plot_nlos_flip(df_res: pd.DataFrame, df_dw: pd.DataFrame | None) -> None:
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.axvspan(-0.5, 6.5, color="#e3f2fd", alpha=0.3, label="DGC safe zone (≤+6 dB)")
-    ax.axhline(0.70, color="red", linestyle="--", linewidth=1, label="70% threshold")
+    ax.axvspan(-0.5, 6.5, color="#e3f2fd", alpha=0.45, label="DW3000 Safe DGC Zone (≤ +6 dB)")
+    ax.axhline(70.0, color="#c62828", linestyle="--", linewidth=1.3, label="70% anchor exclusion line")
 
-    flip_cols = [c for c in df_res.columns if c.startswith("flip_")]
-    if not flip_cols:
-        logger.warning("No flip columns found in results.")
-        return
-
-    regimes = df_res["regime"].unique()
-    style_map = {
-        "flip_aps006_10dB": ("APS006 >10dB", "-"),
-        "flip_aps006_6dB":  ("APS006 >6dB", "--"),
-        "flip_lgbm_cls_csv": ("LightGBM-Cls (CSV)", "-."),
-        "flip_aps006_cir_10dB": ("APS006-CIR >10dB", "-"),
-        "flip_aps006_cir_6dB":  ("APS006-CIR >6dB", "--"),
-        "flip_lgbm_cls_cir":    ("LightGBM-Cls (CIR)", "-."),
-    }
-    color_cycle = plt.cm.tab10(np.linspace(0, 1, 10))
-
-    ci = 0
-    for regime in regimes:
+    specs = [
+        ("A", "flip_aps006_cir_10dB", "APS006 >10 dB (IIoT19)", "-",  "o", "#1565C0"),
+        ("A", "flip_aps006_cir_6dB",  "APS006 >6 dB Flag (IIoT19)", "--", "s", "#42A5F5"),
+        ("A", "flip_lgbm_cls_cir",    "LightGBM-Cls (IIoT19 CIR)", "-.", "^", "#6A1B9A"),
+        ("A", "flip_cnn_cls",         "CNN-Cls Regime A (IIoT19)", "-",  "d", "#2E7D32"),
+        ("B", "flip_cnn_cls",         "CNN-Cls Regime B (IIoT19)", "-",  "v", "#E65100"),
+    ]
+    for regime, col, lbl, ls, mk, color in specs:
         sub = df_res[df_res["regime"] == regime]
-        for fc in flip_cols:
-            if fc not in sub.columns or sub[fc].isna().all():
-                continue
-            lbl, ls = style_map.get(fc, (fc, "-"))
-            grouped = sub.groupby("power_dB")[fc].mean()
-            ax.plot(grouped.index, grouped.values * 100,
-                    marker="o", linestyle=ls, color=color_cycle[ci % 10],
-                    label=f"{lbl} ({regime})", linewidth=1.5)
-            ci += 1
+        if not sub.empty and col in sub.columns and sub[col].notna().any():
+            g = sub.groupby("power_dB")[col].mean() * 100.0
+            ax.plot(g.index, g.values, marker=mk, linestyle=ls, color=color, label=lbl, linewidth=2)
 
-    ax.set_xlabel("Injected Power (dB)", fontsize=12)
-    ax.set_ylabel("LOS → NLOS Flip Rate (%)", fontsize=12)
-    ax.set_title("NLOS Classifier Flip Rate vs. Attacker Power", fontsize=14)
+    if df_dw is not None:
+        g_dw10 = df_dw.groupby("power_dB")["flip_dw3000_aps10_phase5_avg"].mean() * 100.0
+        g_dw6  = df_dw.groupby("power_dB")["flip_dw3000_aps6_phase5_avg"].mean() * 100.0
+        g_dwcnnB = df_dw.groupby("power_dB")["flip_dw3000_cnnB_phase5_avg"].mean() * 100.0
+        ax.plot(g_dw10.index, g_dw10.values, marker="*", linestyle="-", color="#00838F",
+                label="APS006 >10 dB (DW3000 5φ)", linewidth=2)
+        ax.plot(g_dw6.index, g_dw6.values, marker="*", linestyle=":", color="#26C6DA",
+                label="APS006 >6 dB (DW3000 5φ)", linewidth=1.8)
+        if g_dwcnnB.notna().any():
+            ax.plot(g_dwcnnB.index, g_dwcnnB.values, marker="P", linestyle="--", color="#AD1457",
+                    label="CNN-Cls Reg B (DW3000 5φ)", linewidth=1.8)
+
+    ax.set_xlabel("Injected Power (dB relative to LOS first path)", fontsize=12)
+    ax.set_ylabel("Clean LOS → NLOS Flip Rate (%)", fontsize=12)
+    ax.set_title("NLOS Classifier Flip Rate vs. Attacker Power", fontsize=13)
     ax.legend(loc="upper left", fontsize=8, ncol=2)
     ax.set_xticks(POWER_DB)
-    ax.set_ylim(-5, 105)
+    ax.set_ylim(-4, 105)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(RESULTS_DIR / "nlos_flip_rate_vs_power.png", dpi=150)
@@ -541,91 +624,50 @@ def _plot_nlos_flip(df_res: pd.DataFrame) -> None:
 def _plot_cir_overlay(
     df: pd.DataFrame,
     cirs: np.ndarray | None,
+    fp_cir_all: np.ndarray | None,
     los_orig_idx: np.ndarray | None,
 ) -> None:
-    """Plot side-by-side: clean LOS, clean NLOS, +6 dB Phantom-NLOS CIR."""
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharey=True)
-
-    if cirs is not None and los_orig_idx is not None and len(los_orig_idx) > 0:
-        # Pick a representative LOS sample
-        i_los = los_orig_idx[0]
-        fp_los = int(df["fpi"].iloc[i_los])
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.2), sharey=True)
+    if cirs is not None and fp_cir_all is not None and los_orig_idx is not None and len(los_orig_idx) > 0:
+        i_los = int(los_orig_idx[min(10, len(los_orig_idx) - 1)])
+        fp_los = int(fp_cir_all[i_los])
         cir_los = np.abs(cirs[i_los])
 
-        # Pick a NLOS sample
-        nlos_mask = df["label"] == 1
-        nlos_idx = df.index[nlos_mask]
-        if len(nlos_idx) > 0:
-            i_nlos = nlos_idx[0]
-            fp_nlos = int(df["fpi"].iloc[i_nlos])
-            cir_nlos = np.abs(cirs[i_nlos])
-        else:
-            i_nlos = i_los
-            fp_nlos = fp_los
-            cir_nlos = cir_los
+        nlos_idx = df.index[df["label"] == 1].values
+        i_nlos = int(nlos_idx[0]) if len(nlos_idx) > 0 else i_los
+        fp_nlos = int(fp_cir_all[i_nlos])
+        cir_nlos = np.abs(cirs[i_nlos])
 
-        # +6 dB attack
-        h_atk = inject_phantom_nlos(cirs[i_los], fp_los, 35.0, 6.0,
-                                     is_complex=True, phi=0.0)
-        cir_atk = np.abs(h_atk)
+        cir_atk = np.abs(inject_phantom_nlos(cirs[i_los], fp_los, 35.0, 6.0, is_complex=False))
 
-        # Plot windows around first path
-        ws = max(0, fp_los - 20)
-        we = min(len(cir_los), fp_los + 100)
-        t = np.arange(ws, we) * 1.0016
+        ws, we = max(0, fp_los - 20), min(len(cir_los), fp_los + 95)
+        t = (np.arange(ws, we) - fp_los) * TAP_NS
+        axes[0].plot(t, cir_los[ws:we], color="#1565C0", linewidth=1.4)
+        axes[0].axvline(0.0, color="green", linestyle="--", alpha=0.6, label="fp_idx")
+        axes[0].set_title("Real Clean LOS (Fontaine IIoT19)", fontsize=11)
+        axes[0].legend(fontsize=8)
 
-        axes[0].plot(t, cir_los[ws:we], color="#1565C0", linewidth=1)
-        axes[0].axvline(fp_los * 1.0016, color="green", linestyle="--", alpha=0.5)
-        axes[0].set_title("Clean LOS", fontsize=11)
+        ws2, we2 = max(0, fp_nlos - 20), min(len(cir_nlos), fp_nlos + 95)
+        t2 = (np.arange(ws2, we2) - fp_nlos) * TAP_NS
+        axes[1].plot(t2, cir_nlos[ws2:we2], color="#E65100", linewidth=1.4)
+        axes[1].axvline(0.0, color="green", linestyle="--", alpha=0.6, label="fp_idx")
+        axes[1].set_title("Real Clean NLOS (Fontaine IIoT19)", fontsize=11)
+        axes[1].legend(fontsize=8)
 
-        ws2 = max(0, fp_nlos - 20)
-        we2 = min(len(cir_nlos), fp_nlos + 100)
-        t2 = np.arange(ws2, we2) * 1.0016
-        axes[1].plot(t2, cir_nlos[ws2:we2], color="#E65100", linewidth=1)
-        axes[1].axvline(fp_nlos * 1.0016, color="green", linestyle="--", alpha=0.5)
-        axes[1].set_title("Clean NLOS", fontsize=11)
-
-        axes[2].plot(t, cir_atk[ws:we], color="#B71C1C", linewidth=1, label="Attacked")
-        axes[2].plot(t, cir_los[ws:we], color="#1565C0", linewidth=0.8,
-                     alpha=0.5, label="Original")
-        axes[2].axvline(fp_los * 1.0016, color="green", linestyle="--", alpha=0.5)
-        axes[2].axvline((fp_los + round(35.0 / 1.0016)) * 1.0016,
-                        color="red", linestyle=":", alpha=0.5, label="Injection point")
-        axes[2].set_title("+6 dB Phantom-NLOS (Δt=35ns)", fontsize=11)
-        axes[2].legend(fontsize=8)
-    else:
-        # Synthetic illustration when no CIR available
-        t = np.arange(0, 150) * 1.0016
-        # Fake LOS pulse
-        pulse = np.zeros(150)
-        pulse[20:25] = [0.2, 0.8, 1.0, 0.6, 0.15]
-        noise = np.random.RandomState(42).normal(0, 0.05, 150)
-        noise = np.abs(noise)
-        los = pulse + noise
-
-        # Fake NLOS
-        nlos = los.copy()
-        nlos[50:60] = [0.3, 0.5, 0.7, 0.9, 0.6, 0.4, 0.3, 0.2, 0.15, 0.1]
-
-        # +6 dB attack
-        atk = los.copy()
-        scale = 10 ** (6 / 20)
-        atk[55:60] += scale * np.array([0.2, 0.8, 1.0, 0.6, 0.15])
-
-        axes[0].plot(t, los, color="#1565C0"); axes[0].set_title("Clean LOS (synthetic)")
-        axes[1].plot(t, nlos, color="#E65100"); axes[1].set_title("Clean NLOS (synthetic)")
-        axes[2].plot(t, atk, color="#B71C1C", label="Attacked")
-        axes[2].plot(t, los, color="#1565C0", alpha=0.5, label="Original")
-        axes[2].set_title("+6 dB Phantom-NLOS (synthetic)")
+        axes[2].plot(t, cir_atk[ws:we], color="#B71C1C", linewidth=1.4, label="+6 dB Attacked")
+        axes[2].plot(t, cir_los[ws:we], color="#1565C0", linewidth=1.0, alpha=0.45, label="Original LOS")
+        axes[2].axvline(0.0, color="green", linestyle="--", alpha=0.6, label="Untouched FP")
+        axes[2].axvline(35.0, color="red", linestyle=":", alpha=0.7, label="Injected Δt=35 ns")
+        axes[2].set_title("+6 dB Phantom-NLOS (Δt=35 ns)", fontsize=11)
         axes[2].legend(fontsize=8)
 
     for ax in axes:
-        ax.set_xlabel("Time (ns)", fontsize=10)
+        ax.set_xlabel("Delay relative to First Path (ns)", fontsize=10)
         ax.grid(True, alpha=0.3)
-    axes[0].set_ylabel("CIR Magnitude", fontsize=10)
-    fig.suptitle("Channel Impulse Response Comparison", fontsize=13, y=1.02)
+    axes[0].set_ylabel("CIR Magnitude (PAC-normalized)", fontsize=10)
+    fig.suptitle("CIR Morphology Comparison: Real LOS vs. Real NLOS vs. +6 dB Phantom-NLOS", fontsize=12)
     fig.tight_layout()
-    fig.savefig(RESULTS_DIR / "sample_cir_overlay.png", dpi=150, bbox_inches="tight")
+    fig.savefig(RESULTS_DIR / "sample_cir_overlay.png", dpi=150)
     logger.info("Saved sample_cir_overlay.png")
     plt.close(fig)
 
@@ -634,76 +676,79 @@ def _plot_cir_overlay(
 #  Verdict
 # ============================================================
 
-def _compute_verdict(df_res: pd.DataFrame) -> str:
-    """Automated Go/No-Go decision based on ≤+6 dB results."""
+def _compute_verdict(df_res: pd.DataFrame, df_dw: pd.DataFrame | None) -> str:
     safe = df_res[df_res["power_dB"] <= 6].copy()
-    if len(safe) == 0:
-        return "VERDICT: INCONCLUSIVE — no results at ≤+6 dB."
+    if safe.empty:
+        return "VERDICT: INCONCLUSIVE — no results at ≤ +6 dB."
 
-    # Check regressor shift
-    reg_cols = [c for c in safe.columns if "median_delta_b_m" in c]
-    max_median_shift = 0.0
+    reg_cols = [c for c in safe.columns if c.startswith("median_delta_b_m_")]
+    asr_cols = [c for c in safe.columns if c.startswith("ASR_050m_")]
+    hard_flip_cols = [c for c in safe.columns if c.startswith("flip_") and "6dB" not in c]
+    flag_flip_cols = [c for c in safe.columns if c.startswith("flip_") and "6dB" in c]
+
+    max_med_shift, best_reg = 0.0, "none"
     for c in reg_cols:
-        vals = safe[c].dropna()
-        if len(vals) > 0:
-            max_median_shift = max(max_median_shift, vals.max())
+        v = safe[c].dropna()
+        if not v.empty and v.max() > max_med_shift:
+            max_med_shift, best_reg = float(v.max()), c
 
-    asr_cols = [c for c in safe.columns if "ASR_050m" in c]
-    max_asr_050 = 0.0
+    max_asr_050, best_asr = 0.0, "none"
     for c in asr_cols:
-        vals = safe[c].dropna()
-        if len(vals) > 0:
-            max_asr_050 = max(max_asr_050, vals.max())
+        v = safe[c].dropna()
+        if not v.empty and v.max() > max_asr_050:
+            max_asr_050, best_asr = float(v.max()), c
 
-    # Check classifier flip — distinguish hard NLOS (>10dB) from flagged (>6dB)
-    # For the verdict, use the >10 dB and ML classifier flip rates (hard NLOS decision)
-    hard_flip_cols = [c for c in safe.columns
-                      if "flip_" in c and "6dB" not in c]
-    max_hard_flip = 0.0
+    max_hard_flip, best_hard_cls = 0.0, "none"
     for c in hard_flip_cols:
-        vals = safe[c].dropna()
-        if len(vals) > 0:
-            max_hard_flip = max(max_hard_flip, vals.max())
+        v = safe[c].dropna()
+        if not v.empty and v.max() > max_hard_flip:
+            max_hard_flip, best_hard_cls = float(v.max()), c
 
-    # Also track the flagged (>6 dB) rate separately
-    flag_flip_cols = [c for c in safe.columns if "flip_" in c and "6dB" in c]
-    max_flag_flip = 0.0
+    max_flag_flip, best_flag_cls = 0.0, "none"
     for c in flag_flip_cols:
-        vals = safe[c].dropna()
-        if len(vals) > 0:
-            max_flag_flip = max(max_flag_flip, vals.max())
+        v = safe[c].dropna()
+        if not v.empty and v.max() > max_flag_flip:
+            max_flag_flip, best_flag_cls = float(v.max()), c
+
+    if df_dw is not None:
+        dw_safe = df_dw[df_dw["power_dB"] <= 6]
+        for c in [c for c in dw_safe.columns if c.startswith("flip_") and "aps6" not in c]:
+            v = dw_safe[c].dropna()
+            if not v.empty and v.max() > max_hard_flip:
+                max_hard_flip, best_hard_cls = float(v.max()), c
+        for c in [c for c in dw_safe.columns if "aps6" in c]:
+            v = dw_safe[c].dropna()
+            if not v.empty and v.max() > max_flag_flip:
+                max_flag_flip, best_flag_cls = float(v.max()), c
 
     lines = [
-        "VERDICT ANALYSIS (at ≤ +6 dB, DGC safe zone):",
-        f"  Max median regressor shift:        {max_median_shift:.3f} m",
-        f"  Max ASR (>0.5 m):                  {max_asr_050*100:.1f}%",
-        f"  Max hard NLOS flip (>10dB / ML):   {max_hard_flip*100:.1f}%",
-        f"  Max flagged flip (>6dB uncertain):  {max_flag_flip*100:.1f}%",
+        "VERDICT ANALYSIS (≤ +6 dB DW3000 Safe DGC Zone):",
+        f"  Max median regressor shift:       {max_med_shift:+.3f} m ({best_reg})",
+        f"  Max ASR (> 0.50 m):               {max_asr_050*100:5.1f}% ({best_asr})",
+        f"  Max hard NLOS flip (>10 dB / ML): {max_hard_flip*100:5.1f}% ({best_hard_cls})",
+        f"  Max uncertain flag (>6 dB):       {max_flag_flip*100:5.1f}% ({best_flag_cls})",
         "",
     ]
 
-    if max_median_shift > 0.5 and max_asr_050 > 0.50:
+    if max_med_shift > 0.50 and max_asr_050 > 0.50:
         lines.append("★ VERDICT: PASS (Full Thesis)")
-        lines.append("  At ≤+6 dB, at least one regressor shifts by >0.5 m on >50% of LOS samples.")
-        lines.append("  The Phantom-NLOS attack is effective for indirect distance reduction")
-        lines.append("  within the DW3000 DGC safe power envelope.")
-    elif max_hard_flip > 0.70:
+        lines.append("  At ≤+6 dB, at least one realistic regressor shifts by >0.5 m on >50% of LOS samples.")
+    elif max_med_shift < 0.20 and max_hard_flip > 0.70:
         lines.append("★ VERDICT: PARTIAL (Anchor Exclusion Only)")
-        lines.append("  At ≤+6 dB, regressors shift <0.5 m median, but hard NLOS classifiers")
-        lines.append(f"  flip >{max_hard_flip*100:.0f}% of LOS links → stealthy anchor exclusion is viable.")
+        lines.append("  At ≤+6 dB, regressors shift <0.2 m, but hard NLOS classifiers flip >70% of LOS links.")
+    elif max_hard_flip > 0.70:
+        lines.append("★ VERDICT: PARTIAL (Anchor Exclusion + Moderate Bias Shift)")
+        lines.append(f"  At ≤+6 dB, regressor shift is {max_med_shift:.3f} m (<0.5 m), while hard NLOS classifiers flip >70%.")
     elif max_flag_flip > 0.70:
-        lines.append("★ VERDICT: PARTIAL (Anchor Flagging)")
-        lines.append("  At ≤+6 dB, regressors shift <0.5 m and hard NLOS classifiers don't flip,")
-        lines.append(f"  but >{max_flag_flip*100:.0f}% of LOS links are flagged as uncertain (>6 dB).")
-        lines.append("  Systems that exclude flagged/uncertain links are vulnerable to anchor exclusion.")
-    elif max_median_shift > 0.2 or max_hard_flip > 0.30:
-        lines.append("★ VERDICT: PARTIAL (Weak Effect)")
-        lines.append("  Some measurable bias shift and/or classifier confusion at ≤+6 dB,")
-        lines.append("  but below the full-thesis thresholds. Attack has limited practical impact.")
+        lines.append("★ VERDICT: PARTIAL (Uncertain-Link Flagging Only)")
+        lines.append("  Hard NLOS classifiers flip <70% and regressor shifts <0.5 m at ≤+6 dB,")
+        lines.append("  but APS006 >6 dB uncertainty flagging exceeds 70%.")
+    elif max_med_shift >= 0.20 or max_hard_flip >= 0.30:
+        lines.append("★ VERDICT: FAIL / WEAK PARTIAL (Below Anchor-Exclusion & Bias Targets)")
+        lines.append("  Neither >0.5 m bias shift (>50% ASR) nor >70% hard NLOS flip is reached at ≤+6 dB.")
     else:
         lines.append("★ VERDICT: FAIL (Floor Too High)")
         lines.append("  Neither regressors nor classifiers move meaningfully at ≤+6 dB.")
-        lines.append("  The DW3000 DGC power constraint effectively prevents Phantom-NLOS.")
 
     return "\n".join(lines)
 
@@ -711,4 +756,3 @@ def _compute_verdict(df_res: pd.DataFrame) -> str:
 if __name__ == "__main__":
     os.chdir(Path(__file__).resolve().parent.parent)
     raise SystemExit(main())
-

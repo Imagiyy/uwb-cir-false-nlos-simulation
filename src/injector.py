@@ -8,7 +8,7 @@ Key physics constraints enforced
 1. **Untouched First Path:** the original LOS peak at fp_index is never
    attenuated, shifted, or duplicated.
 2. **Amplitude vs. Power dB:**  +X dB *power* boost  →  linear amplitude
-   scale = 10^(X / 20).  E.g. +6 dB → ×1.995.
+   scale = 10^(X / 20).  E.g. +6 dB → ×1.9953.
 3. **Tap period:**  1 CIR tap ≈ 1.0016 ns  (499.2 MHz chip rate).
 4. **Pulse template:** extracted from [fp−3 : fp+12] after noise-floor
    subtraction (magnitude) or directly (complex I/Q).
@@ -29,6 +29,7 @@ import numpy as np
 TAP_NS = 1.0016  # ns per CIR tap
 
 logger = logging.getLogger(__name__)
+_LOGGED_MAGNITUDE_ASSUMPTION = False
 
 
 # ------------------------------------------------------------------
@@ -92,6 +93,14 @@ def inject_phantom_nlos(
     -------
     cir_atk : Modified CIR (same dtype as input).
     """
+    global _LOGGED_MAGNITUDE_ASSUMPTION
+    if not is_complex and not _LOGGED_MAGNITUDE_ASSUMPTION:
+        logger.info(
+            "Magnitude-only CIR injection: complex tail interference is negligible "
+            "at Δt >= 10 ns since a 500 MHz UWB pulse is ~2 ns wide."
+        )
+        _LOGGED_MAGNITUDE_ASSUMPTION = True
+
     N          = len(cir)
     delta_taps = round(delta_t_ns / TAP_NS)
     scale      = 10.0 ** (power_db / 20.0)
@@ -140,7 +149,7 @@ def inject_with_phase_averaging(
     n_phase_draws: int = 5,
     seed: int = 42,
 ) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
-    """Inject with multiple random phases and return averaged magnitude.
+    """Inject with multiple random phases and return magnitudes across draws.
 
     Returns
     -------
@@ -151,18 +160,20 @@ def inject_with_phase_averaging(
     rng    = np.random.RandomState(seed)
     phases = rng.uniform(0, 2 * np.pi, size=n_phase_draws)
 
-    mags = []
-    for ph in phases:
-        mags.append(np.abs(
-            inject_phantom_nlos(cir, fp_idx, delta_t_ns, power_db,
-                                is_complex=True, phi=ph)
-        ))
+    mags = [
+        np.abs(
+            inject_phantom_nlos(
+                cir, fp_idx, delta_t_ns, power_db, is_complex=True, phi=float(ph)
+            )
+        )
+        for ph in phases
+    ]
 
     mag_worst = np.abs(
-        inject_phantom_nlos(cir, fp_idx, delta_t_ns, power_db,
-                            is_complex=True, phi=0.0)
+        inject_phantom_nlos(
+            cir, fp_idx, delta_t_ns, power_db, is_complex=True, phi=0.0
+        )
     )
 
     mag_avg = np.mean(mags, axis=0)
     return mag_avg, mag_worst, mags
-
