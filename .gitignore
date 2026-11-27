@@ -40,3 +40,6 @@ results/
 .vscode/
 .idea/
 
+# Third-party reference repositories
+external/
+
