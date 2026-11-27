@@ -177,3 +177,112 @@ def inject_with_phase_averaging(
 
     mag_avg = np.mean(mags, axis=0)
     return mag_avg, mag_worst, mags
+
+
+# ------------------------------------------------------------------
+# Diffuse multi-tap injection (K closely spaced decaying paths)
+# ------------------------------------------------------------------
+
+def diffuse_amplitude_weights(
+    offsets_ns: tuple[float, ...] = (0.0, 4.0, 9.0),
+    decay_ns: float = 5.0,
+) -> np.ndarray:
+    """Compute normalized per-tap amplitude multipliers sqrt(p_k), sum(p_k)=1."""
+    offs = np.asarray(offsets_ns, dtype=float)
+    pow_w = np.exp(-offs / max(decay_ns, 1e-6))
+    pow_w /= np.sum(pow_w)
+    return np.sqrt(pow_w)
+
+
+def inject_diffuse_nlos(
+    cir: np.ndarray,
+    fp_idx: int,
+    delta_t_ns: float,
+    total_power_db: float,
+    *,
+    offsets_ns: tuple[float, ...] = (0.0, 4.0, 9.0),
+    decay_ns: float = 5.0,
+    is_complex: bool = False,
+    phis: Optional[np.ndarray] = None,
+    seed: Optional[int] = None,
+) -> np.ndarray:
+    """Inject K=3 decaying delayed copies whose summed power equals total_power_db.
+
+    Total linear amplitude scale A = 10^(total_power_db / 20); each component k
+    uses amplitude scale a_k = sqrt(p_k) * A so sum(a_k^2) = 10^(total_power_db / 10).
+    """
+    global _LOGGED_MAGNITUDE_ASSUMPTION
+    if not is_complex and not _LOGGED_MAGNITUDE_ASSUMPTION:
+        logger.info(
+            "Magnitude-only CIR injection: complex tail interference is negligible "
+            "at Δt >= 10 ns since a 500 MHz UWB pulse is ~2 ns wide."
+        )
+        _LOGGED_MAGNITUDE_ASSUMPTION = True
+
+    N = len(cir)
+    amp_w = diffuse_amplitude_weights(offsets_ns, decay_ns=decay_ns)
+    total_scale = 10.0 ** (total_power_db / 20.0)
+    pulse, _ = extract_pulse_template(cir, fp_idx, is_complex=is_complex)
+
+    if is_complex and phis is None:
+        rng = np.random.RandomState(seed)
+        phis = rng.uniform(0.0, 2.0 * np.pi, size=len(offsets_ns))
+
+    cir_atk = cir.copy()
+    for k, off_ns in enumerate(offsets_ns):
+        dt_k = delta_t_ns + off_ns
+        delta_taps = round(dt_k / TAP_NS)
+        scale_k = total_scale * float(amp_w[k])
+
+        inj_s = fp_idx - 3 + delta_taps
+        inj_e = inj_s + len(pulse)
+        p_slice = pulse
+        if inj_s < 0 or inj_e > N:
+            src_s = max(0, -inj_s)
+            src_e = min(len(pulse), N - inj_s)
+            inj_s = max(0, inj_s)
+            inj_e = min(N, inj_e)
+            p_slice = pulse[src_s:src_e]
+        if len(p_slice) == 0:
+            continue
+
+        if is_complex:
+            inj = scale_k * np.exp(1j * float(phis[k])) * p_slice
+        else:
+            inj = scale_k * p_slice
+        cir_atk[inj_s:inj_e] += inj
+
+    return cir_atk
+
+
+def inject_diffuse_with_phase_averaging(
+    cir: np.ndarray,
+    fp_idx: int,
+    delta_t_ns: float,
+    total_power_db: float,
+    n_phase_draws: int = 5,
+    seed: int = 42,
+    offsets_ns: tuple[float, ...] = (0.0, 4.0, 9.0),
+    decay_ns: float = 5.0,
+) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
+    """Complex diffuse injection across independent random phase tuples and phi=0."""
+    rng = np.random.RandomState(seed)
+    k_paths = len(offsets_ns)
+    mags = []
+    for _ in range(n_phase_draws):
+        phis = rng.uniform(0.0, 2.0 * np.pi, size=k_paths)
+        mags.append(np.abs(
+            inject_diffuse_nlos(
+                cir, fp_idx, delta_t_ns, total_power_db,
+                offsets_ns=offsets_ns, decay_ns=decay_ns,
+                is_complex=True, phis=phis,
+            )
+        ))
+    mag_worst = np.abs(
+        inject_diffuse_nlos(
+            cir, fp_idx, delta_t_ns, total_power_db,
+            offsets_ns=offsets_ns, decay_ns=decay_ns,
+            is_complex=True, phis=np.zeros(k_paths),
+        )
+    )
+    return np.mean(mags, axis=0), mag_worst, mags
